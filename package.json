@@ -1,0 +1,44 @@
+{
+  "name": "com.rtmpe.sdk",
+  "version": "1.0.5",
+  "displayName": "RTMPE SDK",
+  "description": "Real-Time Multiplayer Engine — Unity client SDK for converting single-player games to multiplayer in under 15 minutes.",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "unity": "2022.3",
+  "documentationUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk-automation/blob/main/Documentation~/index.md",
+  "changelogUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk-automation/blob/main/CHANGELOG.md",
+  "keywords": [
+    "multiplayer",
+    "networking",
+    "realtime",
+    "udp",
+    "flatbuffers"
+  ],
+  "author": {
+    "name": "RTMPE",
+    "url": "https://github.com/rtmpengine"
+  },
+  "dependencies": {},
+  "samples": [
+    {
+      "displayName": "Basic Connection",
+      "description": "Demonstrates connecting to the RTMPE server, handling connection events, and graceful disconnect.",
+      "path": "Samples~/BasicConnection"
+    },
+    {
+      "displayName": "Player Spawn Flow",
+      "description": "Connect, open a room and spawn the local player, with the prefab id resolved from the generated registry rather than typed into a field.",
+      "path": "Samples~/PlayerSpawnFlow"
+    },
+    {
+      "displayName": "Scene Transitions",
+      "description": "A room moving between two scenes with no scene-loading code: RtmpeSceneLoader does the loading and the reporting, the sample decides only when.",
+      "path": "Samples~/SceneTransitions"
+    },
+    {
+      "displayName": "Two Player Room",
+      "description": "Two clients in one room, moving. Matchmaking opens the room, a shipped component supplies the API key a build cannot get from the Editor, and the avatar requires both motion components rather than trusting a prefab to carry them.",
+      "path": "Samples~/TwoPlayerRoom"
+    }
+  ]
+}

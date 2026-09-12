@@ -1,0 +1,1386 @@
+// RTMPE SDK — Runtime/Core/NetworkManager.GameData.cs
+//
+// StateSync + Variable update + RPC send paths + ApplyDamage RPC + BuildPacket.
+// Part of the NetworkManager partial class — see NetworkManager.cs for the
+// canonical class declaration, base type, and Unity attributes.
+
+using System;
+using System.Collections;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using RTMPE.Threading;
+using RTMPE.Transport;
+using RTMPE.Crypto;
+using RTMPE.Crypto.Internal;
+using RTMPE.Protocol;
+using RTMPE.Rooms;
+using RTMPE.Core.Diagnostics;
+using RTMPE.Rpc;
+using RTMPE.Sync;
+using RTMPE.Infrastructure.Compression;
+
+namespace RTMPE.Core
+{
+    public sealed partial class NetworkManager
+    {
+        // ── State-sync inbound handler ────────────────────────────────
+
+        /// <summary>
+        /// Route incoming <c>StateSync</c>/<c>Data</c> server broadcasts to
+        /// the appropriate sync component on the matching spawned object.
+        ///
+       /// <para>Dispatch priority:</para>
+        /// <list type="number">
+        ///  <item><see cref="TransformPacketParser"/> — handles transform deltas (changed_mask bits within 0x1F: position/rotation/scale + the SDKS-01 input-tick bit 0x08 + the broadcast server-tick bit 0x10).</item>
+        ///  <item><see cref="PhysicsPacketParser.IsPhysics2D"/> — handles 2-D Rigidbody2D packets (bit 0x80 set).</item>
+        ///  <item><see cref="PhysicsPacketParser.IsPhysics3D"/> — handles 3-D Rigidbody packets (bit 0x40 set, bit 0x80 clear).</item>
+        /// </list>
+        ///
+       /// Subscribed to <see cref="OnDataReceived"/> in <see cref="InitialiseNetwork"/>.
+        /// </summary>
+        private void HandleStateSyncPacket(byte[] data)
+        {
+            if (_spawnManager == null) return;
+
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"StateSync packet rejected; not in a room (state={_state}).");
+                return;
+            }
+
+            var payload = PacketParser.ExtractPayload(data);
+            if (payload == null || payload.Length < 9) return;
+
+            // ── 1a. Try quantized transform parse ─────────────────────────────
+            // The 25-byte quantized layout encodes [flags|object_id|3×half|smallest3|3×half].
+            // Detect it BEFORE the legacy delta parser — TryParseStateDelta would
+            // otherwise mis-read object_id from bytes 0..7 (which include the
+            // flags byte) and then mask-check against byte 8 (the high byte of
+            // the real object_id in the quantized layout), silently dropping
+            // every quantized update.
+            //
+            // Disambiguation guard: a single-field StateDelta is also 25 bytes
+            // and trips FLAG_QUANTIZED for odd ObjectIDs, so length and the flag
+            // bit cannot separate the two formats. LooksLikeQuantizedFrame settles
+            // it on the byte-8 discriminator (see its summary). Because the
+            // broadcast channel only ever carries StateDeltas, a misclassification
+            // here would silently drop the common position/scale deltas — so the
+            // predicate is unit-tested independently of this Unity-only path.
+            if (TransformPacketParser.LooksLikeQuantizedFrame(payload))
+            {
+                if (TransformPacketParser.TryParseQuantizedUpdate(
+                        payload, out ulong qObjectId, out TransformState qState))
+                {
+                    var qNb = _spawnManager.Registry.Get(qObjectId);
+                    if (qNb == null) return;
+
+                    // Receive-side interest filter — mirrors the legacy delta
+                    // path.  The quantized payload always carries position, so
+                    // the incoming-vs-live-transform fallback collapses to the
+                    // packet position unconditionally.
+                    if (!qNb.IsOwner && InterestManager.IsReceiveFilterActive)
+                    {
+                        var (lh1, lh2) = InterestManager.LocalPosition;
+                        Vector3 objPos = qState.Position;
+                        float dx  = objPos.x - lh1;
+                        float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                        if (!InterestManager.ShouldDeliver(qObjectId, dx * dx + dh2 * dh2)) return;
+                    }
+
+                    if (qNb.IsOwner)
+                    {
+                        // Receive hot-path uses the cached NetworkBehaviour
+                        // accessor: at 30 Hz × N peers, GetComponent<T> per
+                        // packet adds up to a measurable slice of the frame
+                        // budget on mobile / IL2CPP builds.
+                        qNb.CachedNetworkTransform?.ApplyReconciliation(qState);
+                        return;
+                    }
+
+                    var qInterp = qNb.CachedNetworkTransformInterpolator;
+                    AdviseIfRemoteMotionCannotBeApplied(qInterp, qObjectId, qNb);
+                    if (qInterp == null) return;
+
+                    qInterp.AddState(qState, UnityEngine.Time.unscaledTimeAsDouble);
+                    return;
+                }
+                // Malformed quantized payload — drop without falling through to
+                // the legacy parser, whose offsets do not match this layout.
+                if (IsDebugLogEnabled)
+                    LogDebug("StateSync: malformed quantized payload, dropped.");
+                return;
+            }
+
+            // ── 1b. Physics dispatch (mutually exclusive with StateDelta) ────
+            // Physics frames set discriminator bits in byte 8 (bit 0x80 for
+            // 2-D, bit 0x40 for 3-D) outside the StateDelta KnownMask of 0x1F.
+            // Dispatching them BEFORE the StateDelta iteration removes the
+            // ambiguity that would otherwise arise on the very first parse
+            // attempt — the StateDelta parser would reject a physics frame on
+            // the unknown-bit guard, but that rejection would also abort the
+            // remainder of any concatenated batch even when the inputs were
+            // legitimate.  The discriminator byte is the same token both
+            // sides peek at, so the dispatch agrees with `IsPhysics2D` /
+            // `IsPhysics3D` by construction.
+            if (PhysicsPacketParser.IsPhysics2D(payload))
+            {
+                HandlePhysicsSync2DPacket(payload);
+                return;
+            }
+            if (PhysicsPacketParser.IsPhysics3D(payload))
+            {
+                HandlePhysicsSyncPacket(payload);
+                return;
+            }
+
+            // ── 2. StateDelta iteration (single record OR concatenated batch) ─
+            // The Sync Service's `BroadcastSyncFrame` (`.delta` subject)
+            // concatenates one serialised `StateDelta` per changed object into
+            // a single `PacketType.StateSync` frame; one-object rooms produce
+            // a single record, multi-object rooms produce N records back to
+            // back.  The loop below dispatches each record to its registered
+            // NetworkObject, advancing through the buffer until exhausted.  A
+            // single malformed record terminates the loop so the remainder
+            // of a poisoned batch cannot drift into a misaligned read of a
+            // later well-formed record.
+            int cursor = 0;
+            int recordsApplied = 0;
+            while (cursor < payload.Length)
+            {
+                if (!TransformPacketParser.TryParseStateDeltaAt(
+                        payload, ref cursor,
+                        out ulong objectId,
+                        out byte changedMask,
+                        out TransformState state))
+                {
+                    if (recordsApplied == 0 && IsDebugLogEnabled)
+                        LogDebug("StateSync: no StateDelta record could be parsed from payload.");
+                    return;
+                }
+                ApplyStateDeltaToObject(objectId, changedMask, state);
+                recordsApplied++;
+            }
+        }
+
+        /// <summary>
+        /// Apply a single decoded <c>StateDelta</c> to its target
+        /// <see cref="NetworkObjectRegistry"/> entry.  Encapsulates the
+        /// per-record interest filter, blended-state construction, and
+        /// owner-vs-remote dispatch so the multi-delta iteration in
+        /// <see cref="HandleStateSyncPacket"/> stays linear.
+        /// </summary>
+        private void ApplyStateDeltaToObject(
+            ulong objectId,
+            byte changedMask,
+            TransformState state)
+        {
+            var nb = _spawnManager.Registry.Get(objectId);
+            if (nb == null) return;
+
+            // ── Receive-side interest filter ──────────────────────────────
+            // When an InterestManager is active with a non-zero radius,
+            // discard state updates for objects outside that radius.
+            // The owning client's objects are always processed regardless of
+            // distance (the owner needs reconciliation data).
+            // This is a secondary client-side guard; the gateway already
+            // performs the primary spatial cull before sending the packet.
+            //
+            // Filter against the INCOMING position when the packet carries
+            // one — falling back to the live transform only when the delta
+            // omits a position field.  Filtering against transform.position
+            // alone would lag one tick behind: a fast-moving object entering
+            // the radius would be discarded for one tick before we accept it.
+            //
+            // ⛔ The fallback stays the transform even though the merge below
+            // no longer trusts it.  `ShouldDeliver` is hysteretic — an
+            // inner/outer band with per-object latched state — so moving the
+            // position it judges moves which side an object latches to, and a
+            // wrong latch withholds every delta until one carries a position.
+            // That is a second behaviour change, in a filter this finding is
+            // not about; the merge is what feeds the interpolator, and it is
+            // repaired below.
+            if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+            {
+                var (lh1, lh2) = InterestManager.LocalPosition;
+                Vector3 objPos;
+                if ((changedMask & TransformPacketParser.ChangedPosition) != 0)
+                    objPos = state.Position;
+                else
+                    objPos = nb.transform.position;
+                // Pick the matching horizontal axis: XZ for 3-D games
+                // (default), XY for 2-D / top-down games.  Without this
+                // dispatch the filter compares an XY-stored local position
+                // against the unused vertical axis of the remote object
+                // and silently rejects every packet for top-down games.
+                float dx = objPos.x - lh1;
+                float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
+            }
+
+            // Build a blended state: merge only the fields present in the delta.
+            // Fields absent from the delta keep zero-initialised values in `state`
+            // which would clobber the object's pose, so they are filled from the
+            // baseline resolved below.
+            //
+            // Resolve the cached NetworkTransform once — the baseline and the
+            // owner reconciliation branch both take it.  The interpolator is
+            // resolved for a replica only: it is the baseline's source and the
+            // remote dispatch's target, and neither is on the owner's path.
+            var cachedNetTransform = nb.CachedNetworkTransform;
+            var interp             = nb.IsOwner ? null : nb.CachedNetworkTransformInterpolator;
+
+            // Which pose is authoritative depends on who drives the transform.
+            // On the owner it is the local prediction, and the live transform is
+            // exactly that.  On a replica the live transform is the
+            // interpolator's own output, sampled at renderTime = now −
+            // interpolationDelay, so filling an absent field from it re-enters
+            // this component's delayed output as a fresh authoritative sample:
+            // the next partial delta then reads a pose that is already behind,
+            // and the replica settles a further delay back on each one.  A
+            // replica therefore fills from the newest snapshot the interpolator
+            // accepted, and reads the transform only before the first one —
+            // where it is the spawn pose rather than a rendered one.
+            TransformState current;
+            if (interp != null && interp.TryGetLatestAcceptedState(out var lastAccepted))
+            {
+                current = lastAccepted;
+            }
+            else if (cachedNetTransform != null)
+            {
+                current = cachedNetTransform.GetState();
+            }
+            else
+            {
+                current = new TransformState
+                {
+                    Position = nb.transform.position,
+                    Rotation = nb.transform.rotation,
+                    Scale    = nb.transform.localScale,
+                };
+            }
+            var blended = new TransformState
+            {
+                Position = (changedMask & TransformPacketParser.ChangedPosition) != 0
+                               ? state.Position : current.Position,
+                Rotation = (changedMask & TransformPacketParser.ChangedRotation) != 0
+                               ? state.Rotation : current.Rotation,
+                Scale    = (changedMask & TransformPacketParser.ChangedScale) != 0
+                               ? state.Scale : current.Scale,
+                // SDKS-01: carry the server-confirmed input tick through to the
+                // owner reconciliation branch.  Presence mirrors the delta's
+                // ChangedInputTick bit exactly (tick 0 is valid, so we trust the
+                // parsed flag rather than the value).
+                ConfirmedInputTick    = state.ConfirmedInputTick,
+                HasConfirmedInputTick = (changedMask & TransformPacketParser.ChangedInputTick) != 0,
+                // Carry the room's broadcast clock through to the non-owner
+                // interpolation branch.  Presence mirrors the delta's
+                // ChangedServerTick bit exactly (tick 0 is valid, so trust the
+                // flag rather than the value).
+                ServerTick            = state.ServerTick,
+                HasServerTick         = (changedMask & TransformPacketParser.ChangedServerTick) != 0,
+            };
+
+            if (nb.IsOwner)
+            {
+                // When the server supplied an authoritative input-tick watermark
+                // (SDKS-01), drive the replay-aware reconciliation overload with
+                // it so the input buffer is trimmed to exactly what the server
+                // confirmed.  Absent the watermark (legacy server, quantized
+                // relay) fall back to the single-argument overload, which
+                // derives a conservative (LocalTick - 1) watermark — preserving
+                // the prior behaviour byte-for-byte.
+                if (blended.HasConfirmedInputTick)
+                    cachedNetTransform?.ApplyReconciliation(
+                        blended, blended.ConfirmedInputTick, true);
+                else
+                    cachedNetTransform?.ApplyReconciliation(blended);
+                return;
+            }
+
+            AdviseIfRemoteMotionCannotBeApplied(interp, objectId, nb);
+            if (interp == null) return;
+
+            // Remote motion timing is one feature split across the sending and
+            // receiving components, and half of it enabled is not half the
+            // benefit — it is none, and in one direction a regression.  Nothing
+            // but documentation held the two together, so a developer enabling
+            // one had no way to learn the other was needed.  Classify what this
+            // prefab actually carries and surface an inconsistency once.
+            if (cachedNetTransform != null)
+            {
+                var pairing = RTMPE.Core.Diagnostics.RemoteMotionTimingAdvisory.Classify(
+                    interp.OwnerTickTimeline, cachedNetTransform.TickAlignedSampling);
+                if (RTMPE.Core.Diagnostics.RemoteMotionTimingAdvisory.ShouldWarn(pairing))
+                    Debug.LogWarning(
+                        RTMPE.Core.Diagnostics.RemoteMotionTimingAdvisory.Compose(
+                            pairing, objectId, nb.name));
+            }
+
+            // Drive the interpolation timeline from the ticks this record carries.
+            // The server broadcast tick reconstructs the render timeline from the
+            // monotone emission cadence and a low-pass clock-offset estimate, so
+            // packet-arrival jitter is filtered out of the remote object's motion.
+            // When owner-tick timelining is enabled on the interpolator the owner
+            // input tick is preferred, binding the motion to the timeline of the
+            // client that produced it, independent of the server's per-tick sample
+            // instant.  Absent the selected tick (server stamping disabled, a
+            // quantized relay that carries no tick, or an anonymous transform) the
+            // interpolator falls back to the receiver clock, preserving the prior
+            // behaviour.
+            interp.AddStateFromBroadcast(
+                blended,
+                blended.ServerTick,         blended.HasServerTick,
+                blended.ConfirmedInputTick, blended.HasConfirmedInputTick,
+                UnityEngine.Time.unscaledTimeAsDouble, FixedTickInterval);
+        }
+
+        // Whether a replica's decoded motion has anywhere to be applied, and the
+        // console line for it when it has not.
+        //
+        // ⛔ Presence is not the question.  GetComponent<T> answers with a
+        // component that is switched off, and a behaviour that is not running is
+        // handed states nothing renders — the same frozen replica the missing
+        // component produces, reached by a configuration every readiness check
+        // that asks only "is one there" reports as sound.
+        //
+        // ⚠️ `enabled`, not `isActiveAndEnabled`, and the difference is a
+        // deliberate silence: a replica under a DEACTIVATED GameObject is also
+        // handed states nothing renders, but that is the shape of every
+        // hide-while-culled and staged-spawn pattern there is, and a line per
+        // such object would be noise a developer cannot act on.  What is
+        // reported is a component switched off on an object that is otherwise
+        // live.
+        //
+        // ⚠️ The object is passed rather than its name.  `Object.name` marshals
+        // a fresh string on every call, arguments are evaluated eagerly, and
+        // this runs once per inbound transform record on both dispatch paths —
+        // so a name read at the call site would allocate ~3 000 strings a second
+        // in a full room to describe a fault that is not there.  The neighbouring
+        // timing advisory keeps its own read inside its gate for the same reason.
+        //
+        // ⚠️ Two bounds, because the per-object latch is not one on its own: it
+        // is dropped at every session end, so a client in a reconnect flap
+        // re-arms it on each attempt and the remote peers re-announce the same
+        // broken replicas.  The rate gate is what a sender cannot choose.
+        //
+        // Both dispatch paths route through here, so the two faults keep one
+        // description each and a third dispatch inherits both.
+        private void AdviseIfRemoteMotionCannotBeApplied(
+            RTMPE.Sync.NetworkTransformInterpolator interp, ulong objectId, NetworkBehaviour nb)
+        {
+            if (interp != null && interp.enabled) return;
+
+            // ⛔ A component switched off when the FIRST record for an object
+            // arrives is not yet a misconfiguration: Start() runs after the
+            // spawn that produced it, and enabling the interpolator there — or
+            // on the first snapshot — is an ordinary shape.  The latch below
+            // never re-opens within a session, so a line written on that record
+            // would describe a state that no longer exists for the rest of the
+            // run.  One still switched off when a second record arrives is a
+            // configuration, and the accepted-state record is what tells the two
+            // apart without a table of our own.
+            if (interp != null && !interp.TryGetLatestAcceptedState(out _)) return;
+
+            if (RTMPE.Core.Diagnostics.RemoteInterpolatorAdvisory.ShouldWarn(objectId) &&
+                WarnGate.ShouldEmit(ref _lastMissingInterpolatorWarnTicks))
+                Debug.LogWarning(
+                    interp == null
+                        ? RTMPE.Core.Diagnostics.RemoteInterpolatorAdvisory.Compose(
+                            objectId, nb == null ? null : nb.name)
+                        : RTMPE.Core.Diagnostics.RemoteInterpolatorAdvisory.ComposeSwitchedOff(
+                            objectId, nb == null ? null : nb.name));
+        }
+
+        /// <summary>
+        /// Route an inbound 3-D physics-sync payload to the
+        /// <see cref="NetworkRigidbody"/> component on the matching object.
+        /// </summary>
+        private void HandlePhysicsSyncPacket(byte[] payload)
+        {
+            if (!PhysicsPacketParser.TryParsePhysicsState(
+                    payload, out ulong objectId, out byte changedMask, out PhysicsState state))
+                return;
+
+            var nb = _spawnManager?.Registry.Get(objectId);
+            if (nb == null) return;
+
+            // Receive-side interest filter — mirrors the transform-packet filter in
+            // HandleStateSyncPacket.  Owners receive reconciliation unconditionally;
+            // non-owners are dropped when the object lies outside the interest radius.
+            if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+            {
+                var (lh1, lh2) = InterestManager.LocalPosition;
+                Vector3 objPos = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                                 ? state.Position
+                                 : nb.transform.position;
+                float dx  = objPos.x - lh1;
+                float dh2 = (InterestManager.LocalUsesXzPlane ? objPos.z : objPos.y) - lh2;
+                if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
+            }
+
+            // Resolve the cached component once; both branches read it.
+            var cachedNetRb = nb.CachedNetworkRigidbody;
+            if (nb.IsOwner)
+            {
+                cachedNetRb?.ApplyReconciliation(state, changedMask);
+                return;
+            }
+
+            cachedNetRb?.ApplyRemoteState(state, changedMask);
+        }
+
+        /// <summary>
+        /// Route an inbound 2-D physics-sync payload to the
+        /// <see cref="NetworkRigidbody2D"/> component on the matching object.
+        /// </summary>
+        private void HandlePhysicsSync2DPacket(byte[] payload)
+        {
+            if (!PhysicsPacketParser.TryParsePhysicsState2D(
+                    payload, out ulong objectId, out byte changedMask, out PhysicsState2D state))
+                return;
+
+            var nb = _spawnManager?.Registry.Get(objectId);
+            if (nb == null) return;
+
+            // Receive-side interest filter — 2-D variant.
+            // PhysicsState2D.Position is Vector2 (x/y world plane), which aligns with
+            // InterestManager when UseXzPlane == false (standard for 2-D games).
+            if (!nb.IsOwner && InterestManager.IsReceiveFilterActive)
+            {
+                var (lh1, lh2) = InterestManager.LocalPosition;
+                float ox = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                           ? state.Position.x : nb.transform.position.x;
+                float oy = (changedMask & PhysicsPacketBuilder.ChangedPosition) != 0
+                           ? state.Position.y : nb.transform.position.y;
+                float dx  = ox - lh1;
+                float dh2 = oy - lh2;
+                if (!InterestManager.ShouldDeliver(objectId, dx * dx + dh2 * dh2)) return;
+            }
+
+            // Resolve the cached component once; both branches read it.
+            var cachedNetRb2D = nb.CachedNetworkRigidbody2D;
+            if (nb.IsOwner)
+            {
+                cachedNetRb2D?.ApplyReconciliation(state, changedMask);
+                return;
+            }
+
+            cachedNetRb2D?.ApplyRemoteState(state, changedMask);
+        }
+
+        // ── Variable update inbound handler ────────────────────────────
+
+        /// <summary>
+        /// Apply an inbound <c>VariableUpdate</c> (0x41) packet from the server
+        /// to the matching spawned object's NetworkVariables.
+        /// Payload: <c>[object_id:8 LE][tick:4 LE][var_count:1][for each: [var_id:4 LE][value_len:2 LE][value_bytes:N]]</c>
+        ///
+        /// The 4-byte tick is the sender's <c>ReplicationTick</c> at flush
+        /// time — a monotonic counter on real time, and NOT the CSP
+        /// <c>LocalTick</c>, which stops with the sender's own game clock.  It
+        /// is meaningful only for ordering one variable's updates against each
+        /// other.  Each
+        /// variable on the receiver maintains its own last-applied-tick
+        /// watermark and rejects updates whose tick is not strictly greater
+        /// (RFC 1982 modular comparison) so a re-ordered datagram cannot
+        /// roll the value back.  The one exception is stated on
+        /// <see cref="RTMPE.Sync.NetworkVariableBase.TryAcceptInboundTick"/>:
+        /// a sender refused for a full second is read as a clock the watermark
+        /// was never drawn from, and is adopted.
+        /// </summary>
+        private void HandleVariableUpdatePacket(byte[] data)
+        {
+            if (_spawnManager == null) return;
+
+            // Game-data packets are valid only after a successful room join;
+            // rejecting earlier traffic prevents pre-room state injection.
+            if (_state != NetworkState.InRoom)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"VariableUpdate packet rejected; not in a room (state={_state}).");
+                return;
+            }
+
+            var payload = PacketParser.ExtractPayload(data);
+            // Minimum: object_id(8) + tick(4) + var_count(1) = 13 bytes.
+            if (payload == null || payload.Length < 13) return;
+
+            // Wire protocol is little-endian.  `BitConverter.ToUInt64` is
+            // platform-endian — see `HandleOwnershipTransferRpc` for the same
+            // correctness rationale.  Decode explicitly LE so the behaviour
+            // matches the gateway on every target architecture.
+            ulong objectId =
+                  (ulong)payload[0]
+                | ((ulong)payload[1] << 8)
+                | ((ulong)payload[2] << 16)
+                | ((ulong)payload[3] << 24)
+                | ((ulong)payload[4] << 32)
+                | ((ulong)payload[5] << 40)
+                | ((ulong)payload[6] << 48)
+                | ((ulong)payload[7] << 56);
+            uint packetTick =
+                  (uint)payload[8]
+                | ((uint)payload[9]  << 8)
+                | ((uint)payload[10] << 16)
+                | ((uint)payload[11] << 24);
+            int varCount = payload[12];
+
+            var nb = _spawnManager.Registry.Get(objectId);
+            if (nb == null) return;
+
+            // An owned object is locally authoritative for its NetworkVariables —
+            // the owner writes them and relays them outward — so an inbound update
+            // addressed to an object we own is a harmless self-echo, a forged
+            // foreign write, or a previous owner's delta still in flight across an
+            // ownership handoff.  Drop the whole packet before parsing, mirroring
+            // the reconcileOwnedObjects gate the transform path applies, unless an
+            // authoritative server is configured to reconcile owned state.
+            if (nb.IsOwner && _settings != null && !_settings.reconcileOwnedObjects)
+                return;
+
+            try
+            {
+                using var ms     = new System.IO.MemoryStream(payload, 13, payload.Length - 13);
+                using var reader = new System.IO.BinaryReader(ms);
+
+                // ── Framing first, application second ─────────────────────
+                //
+                // 🚨 Two guards below used to say "rejecting packet" and reject
+                // nothing: the budget cap returned mid-loop with every earlier
+                // entry already applied, and the trailing-bytes check ran after
+                // the loop had finished. A third fault — truncation — had no
+                // message of its own and was reported by the trailing-bytes one,
+                // so bytes that were MISSING were announced as bytes that were
+                // extra.
+                //
+                // The framing is a property of six bytes per entry, so it is
+                // settled before anything is deserialised. `Inspect` restores
+                // the stream position itself, so the apply loop starts where it
+                // always did.
+                var framing = RTMPE.Core.Sync.VariableBatchFramer.Inspect(
+                    ms, varCount, MaxVariableUpdateCumulativeBytes);
+
+                if (framing.Fault != RTMPE.Core.Sync.VariableBatchFault.None)
+                {
+                    ReportMalformedVariableBatch(objectId, varCount, framing);
+                    return;
+                }
+
+                // 🚨 AFTER the inspection, not before it. `var_count == 0` is a
+                // legal update — the gateway forwards one and says so — but it
+                // used to return here on the way in, so a zero-variable packet
+                // carrying 60 KB of residue was dropped in silence. That is
+                // exactly the shape the trailing-bytes message describes: bytes
+                // smuggled past a reader that stops counting at var_count. The
+                // reader has now counted before it stops.
+                if (varCount == 0) return;
+
+                for (int i = 0; i < varCount; i++)
+                {
+                    // Wire format: [var_id:4 LE][value_len:2 LE][value_bytes:N]
+                    // Read value_len before dispatching to ApplyVariableUpdate.
+                    // If the var_id is unknown, advance the reader by value_len bytes
+                    // so subsequent variables in this packet are parsed correctly.
+                    // Both bounds are unreachable while `Inspect` above and
+                    // this loop agree about the same bytes — which is exactly
+                    // why they stay. They are the only thing standing between an
+                    // edit that desynchronises the two readings and an over-read
+                    // past the end of the payload, and reaching them costs one
+                    // dropped update rather than a corrupted one.
+                    if (ms.Length - ms.Position < 6) break; // need var_id(4) + value_len(2)
+                    uint   varId    = reader.ReadUInt32();
+                    ushort valueLen = reader.ReadUInt16();
+
+                    if (ms.Length - ms.Position < valueLen) break; // truncated packet
+
+                    long valueStart = ms.Position;
+
+                    // Dispatch over a reader that cannot leave this entry.
+                    //
+                    // ⛔ A zero-length entry is dispatched like any other, and
+                    // that is deliberate. `NetworkVariable.Serialize` writes
+                    // `value_len = 0` when a custom `Serialize()` throws or the
+                    // value exceeds the ushort wire cap — but its SUCCESS path
+                    // writes byte-identical bytes for a type that legitimately
+                    // serialises to nothing, so the wire does not carry the
+                    // difference and the receiver must not invent it. An earlier
+                    // version treated 0 as a "skip record", which dropped the
+                    // legitimate empty value and blamed a sender that had done
+                    // nothing wrong. Bounded, the ambiguity costs nothing: a
+                    // type that needs bytes finds none and is reported below, and
+                    // a type that needs none succeeds.
+                    //
+                    // `valueLen` was passed down and never enforced, so
+                    // Deserialize read whatever its type wanted: too few
+                    // declared bytes and it consumed the next variable's,
+                    // silently, with the re-seek below repairing the framing so
+                    // nothing ever reported it. The entry reader turns that into
+                    // an end-of-stream throw, and the catch turns the throw into
+                    // the loss of ONE variable's update instead of the datagram
+                    // — which is what an over-read across the last entry would
+                    // otherwise cost.
+                    try
+                    {
+                        var entryReader = _variableEntryReader.Open(ms, valueStart, valueLen);
+                        nb.ApplyVariableUpdate(
+                            varId, entryReader, valueLen, packetTick, hasPacketTick: true);
+                    }
+                    catch (Exception ex)
+                    {
+                        // The message is carried, not just the type name.
+                        // `NetworkVariableString.Deserialize` says exactly how
+                        // many bytes it wanted and how many it had, and throwing
+                        // that away leaves an integrator with a category where a
+                        // diagnosis was available. It is sanitised because a
+                        // custom Deserialize may quote what it was handed.
+                        //
+                        // No cause is asserted: this catches anything a
+                        // Deserialize can throw — including an application
+                        // exception from a user's own type — and naming one
+                        // cause would be wrong for most of them.
+                        if (ShouldWarn(ref _lastVariableDeserialiseFaultWarnTicks))
+                            Debug.LogWarning(
+                                $"[RTMPE] VariableUpdate: variable {varId} on object {objectId} " +
+                                $"declared {valueLen} value bytes and its Deserialize threw " +
+                                UntrustedLogText.Sanitise(ex.GetType().Name) + ": " +
+                                UntrustedLogText.Sanitise(ex.Message) +
+                                ". Keeping the previous value; the rest of the packet is " +
+                                "unaffected.");
+                    }
+
+                    // Ensure the reader is positioned exactly after value_bytes,
+                    // even if ApplyVariableUpdate consumed fewer or more bytes
+                    // (or skipped the value entirely on a stale-tick rejection).
+                    ms.Position = valueStart + valueLen;
+                }
+
+            }
+            catch (Exception ex)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"VariableUpdate: parse error for objectId {objectId}: {ex.Message}");
+            }
+        }
+
+        // Per-packet upper bound on cumulative declared variable bytes — a
+        // BACKSTOP, and today an unreachable one.  Both halves are written down
+        // because two earlier versions of this comment justified it with
+        // numbers that were not true.
+        //
+        // ⚠️ The first justified it by the wire format's nominal maximum,
+        // 255 × 65535 ≈ 16 MiB.  That cannot arrive: `PacketParser` refuses a
+        // `payload_len` over 1 MiB, and a UDP datagram tops out at 65507 bytes.
+        //
+        // ⚠️ The second — written when the enforcement moved ahead of the apply
+        // loop — claimed 64 KiB of declared value bytes "still fits in one
+        // datagram".  It does not, and the margin is the whole point.
+        // `UdpTransport` is the only transport this SDK ships and `NetworkThread`
+        // sizes its receive rental at `PacketBuilder.MaxDatagramBytes` = 65527,
+        // so take off the 13-byte packet header and the 13-byte
+        // object/tick/count header: the largest batch region that can arrive is
+        // **65501** bytes, and AEAD shrinks it by another 20.  Against a 65536
+        // ceiling the margin is 35 bytes, and this arm cannot fire.
+        //
+        // 🚨 The number here was 65481 in its first writing — computed from
+        // UDP's own 65507-byte payload limit while the test written to hold it
+        // reads the tree's constant.  Both bounds are real and 65527 is the
+        // looser of the two, so it is the one this claim has to survive; the
+        // guard uses it.  ⛔ That was the THIRD arithmetic error in a comment
+        // whose two paragraphs above it each document a previous arithmetic
+        // error in the same comment, which is its own argument for the guard.
+        //
+        // ⛔ It is kept rather than deleted, and not out of caution: the gateway
+        // already speaks a WebSocket transport (`7779/tcp`), a browser client is
+        // the reason it exists, and a WS frame has no 65507-byte ceiling to
+        // stand in for this one.  The day that transport lands here, this arm
+        // is the bound — so it is tested, reported and quoted correctly now,
+        // while the cost of being wrong about it is nil.
+        // `VariableUpdateCeilingReachabilityTests` holds the arithmetic and
+        // fails the day it stops being true.
+        //
+        // ⛔ And it is not "the gateway's safe-message ceiling": no such
+        // constant exists there.  The only 65536s in the gateway are
+        // `recv_buffer_size` and `send_buffer_size`, which are socket buffers
+        // and not a message-size policy.  An earlier comment said otherwise.
+        //
+        // Class scope rather than a local, because the inspection that ENFORCES
+        // it and the message that QUOTES it are in different methods — and a
+        // ceiling written twice is two ceilings that agree until one is edited.
+        private const int MaxVariableUpdateCumulativeBytes = 64 * 1024;
+
+        // One gate per fault. A batch whose residue is being reported every
+        // second must not silence a truncated one arriving beside it, and the
+        // rate at which each fires is a different diagnosis: residue is protocol
+        // drift or smuggling, truncation is a sender that built the batch wrong,
+        // and the budget is a sender asking for more main-thread work than the
+        // receiver will spend.
+        private long _lastVariableUpdateTrailingWarnTicks;
+        private long _lastVariableUpdateTruncatedWarnTicks;
+        private long _lastVariableUpdateBudgetWarnTicks;
+
+        // Reports a batch refused BEFORE anything in it was applied — which is
+        // what lets each of these say "rejecting" and mean it.
+        private void ReportMalformedVariableBatch(
+            ulong objectId, int varCount, RTMPE.Core.Sync.VariableBatchFraming framing)
+        {
+            switch (framing.Fault)
+            {
+                case RTMPE.Core.Sync.VariableBatchFault.Truncated:
+                    if (ShouldWarn(ref _lastVariableUpdateTruncatedWarnTicks))
+                        Debug.LogWarning(
+                            $"[RTMPE] VariableUpdate: declared {varCount} variable(s) for " +
+                            $"objectId {objectId} but the payload ends inside entry " +
+                            // `EntriesFramed` counts the entries that were framed
+                            // WHOLE, so the one that ran off the end is the next
+                            // after them. Printing the count itself named entry 0
+                            // for a fault in the first entry and entry 1 for a
+                            // fault in the second.
+                            $"{framing.EntriesFramed + 1} of {varCount}; rejecting the packet, " +
+                            "no variable was applied. The sender built a batch shorter than its " +
+                            "own header declares.");
+                    break;
+
+                case RTMPE.Core.Sync.VariableBatchFault.TrailingBytes:
+                    if (ShouldWarn(ref _lastVariableUpdateTrailingWarnTicks))
+                        Debug.LogWarning(
+                            $"[RTMPE] VariableUpdate: {framing.ResidueBytes} trailing byte(s) " +
+                            $"after {varCount} declared variable(s) for objectId {objectId}; " +
+                            "rejecting the packet, no variable was applied. Residue is either " +
+                            "protocol drift or bytes smuggled past a reader that stops counting " +
+                            "at var_count.");
+                    break;
+
+                case RTMPE.Core.Sync.VariableBatchFault.OverBudget:
+                    if (ShouldWarn(ref _lastVariableUpdateBudgetWarnTicks))
+                        Debug.LogWarning(
+                            // ⚠️ "entry bytes", not "value bytes": the counter
+                            // includes each entry's 6-byte header as well as its
+                            // declared value, because that is what the ceiling
+                            // is compared against. Naming it "value bytes"
+                            // overstates the value total by 6 × entries — up to 1530
+                            // — which is the same class of untrue operator
+                            // message this batch was opened to repair.
+                            $"[RTMPE] VariableUpdate: declared {framing.CumulativeBytes} bytes " +
+                            $"of variable entries (values plus their 6-byte headers) for " +
+                            $"objectId {objectId}, over the {MaxVariableUpdateCumulativeBytes}-" +
+                            "byte per-packet ceiling; rejecting the packet, no variable was " +
+                            "applied. ⛔ The ceiling bounds DECLARED bytes on the wire — it is " +
+                            "not a bound on deserialisation work, which a single entry can " +
+                            "amplify (see WireByteBlock).");
+                    break;
+            }
+        }
+
+        // One per NetworkManager, reused across every entry of every packet: the
+        // reader copies an entry into a scratch buffer and a stream that grow to
+        // the largest entry seen and are then reused.
+        //
+        // ⚠️ "and then allocates nothing" is what this comment used to say, and
+        // it is not true. A fresh `BinaryReader` is built per entry — deliberately,
+        // because a pooled one carries its UTF-8 `Decoder` across entries and one
+        // variable's trailing bytes then decode into the next variable's string.
+        // Measured over a 255-entry packet: 41,512 bytes, of which 40,800 are
+        // those readers. The doubling saves about 2.3× against sizing each
+        // buffer to its entry; it does not eliminate the allocation.
+        private readonly RTMPE.Core.Sync.VariableEntryReader _variableEntryReader =
+            new RTMPE.Core.Sync.VariableEntryReader();
+
+        // Its own gate, not the trailing-bytes one above: a packet whose
+        // residue is being reported every second must not silence a variable
+        // whose Deserialize is throwing, and the reverse.
+        private long _lastVariableDeserialiseFaultWarnTicks;
+
+        // One gate per fault, not one for both: an argument fault is the
+        // caller's and a framing fault is not, and a caller spending the budget
+        // on its own mistakes would decide whether the other is ever reported.
+        private long _lastEnhancedRpcRefusalWarnTicks;
+        private long _lastEnhancedRpcFaultWarnTicks;
+
+        // The packet step's refusal keeps a slot of its own rather than sharing
+        // the payload step's.  It is reachable only if the two ceilings drift
+        // apart, which is a property of the build rather than of the call — so
+        // it would fire for every send, and sharing would let ordinary argument
+        // mistakes decide whether the one signal that names a real divergence is
+        // ever printed.  Rate per reason, as RpcFailureGates already does it.
+        private long _lastEnhancedRpcPacketRefusalWarnTicks;
+
+        // ── Variable update send path ─────────────────────────────────
+
+        /// <summary>
+        /// Build and enqueue a <c>VariableUpdate</c> (0x41) packet.
+        /// Called by <see cref="NetworkBehaviour.FlushDirtyVariables"/> for each
+        /// owned object that has dirty NetworkVariables.
+        /// </summary>
+        internal void SendVariableUpdate(byte[] payload)
+            => SendVariableUpdate(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendVariableUpdate(byte[])"/>.
+        /// Wraps <paramref name="payloadLength"/> bytes from <paramref name="payload"/>
+        /// — accepts an oversized buffer (e.g. rented from <c>ArrayPool&lt;byte&gt;.Shared</c>)
+        /// and uses only the leading <paramref name="payloadLength"/> bytes.
+        /// </summary>
+        internal void SendVariableUpdate(byte[] payload, int payloadLength)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payloadLength <= 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.VariableUpdate,
+                PacketFlags.Reliable,
+                payload, payloadLength);
+
+            // Hand the packet to the reliable send path so it is registered
+            // in the ReliableChannel retransmit table and re-emitted on RTO
+            // expiry until the gateway acknowledges it.  When the ARQ wire
+            // extension is not negotiated the same call degrades to a single
+            // best-effort transmission, matching the historical semantics.
+            Send(packet, reliable: true);
+        }
+
+        /// <summary>
+        /// Build and enqueue a coalesced VariableBatchUpdate (0x44) packet.
+        /// Invoked from the per-tick variable flush when
+        /// <c>NetworkSettings.enableVariableBatching</c> is true; the batch
+        /// payload was built by <see cref="VariableBatchBuilder.Build"/>.
+        /// </summary>
+        internal void SendVariableBatchUpdate(byte[] payload)
+            => SendVariableBatchUpdate(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendVariableBatchUpdate(byte[])"/>.
+        /// </summary>
+        internal void SendVariableBatchUpdate(byte[] payload, int payloadLength)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payloadLength <= 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.VariableBatchUpdate,
+                PacketFlags.Reliable,
+                payload, payloadLength);
+
+            // Coalesced variable batches share the per-object update's
+            // delivery contract: route through the reliable send path for
+            // retransmit-table registration, degrading to best-effort when
+            // the ARQ wire extension is not negotiated.
+            Send(packet, reliable: true);
+        }
+
+        // ── Position update send path (Feature #6 — Interest Management) ───
+
+        /// <summary>
+        /// Build and enqueue a <c>PositionUpdate</c> (0x42) packet carrying the
+        /// client's 2-D world position so the gateway can apply zone-based
+        /// interest filtering to room-wide broadcasts.
+        ///
+       /// <para>Call this from <see cref="RTMPE.Rooms.InterestManager"/> at the
+        /// configured update interval while in a room.  Sending outside a room is
+        /// a no-op (the gateway has no room context to filter against).</para>
+        ///
+       /// <para>Payload layout: <c>[x: f32 LE 4 B][y: f32 LE 4 B]</c> — 8 bytes.</para>
+        /// </summary>
+        internal void SendPositionUpdate(float x, float y)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+
+            // Sender-side finiteness gate.  The gateway parser rejects any
+            // NaN/±Inf component as a malformed transform, tearing the
+            // channel down and forcing the client into a full reconnect.
+            // Surfacing the misuse at the call boundary lets the caller's
+            // own controller logic fail with a clear exception instead of
+            // silently corrupting the session.  Matches InputPayload.WriteTo.
+            if (float.IsNaN(x) || float.IsInfinity(x))
+                throw new InvalidOperationException("SendPositionUpdate: x is not finite");
+            if (float.IsNaN(y) || float.IsInfinity(y))
+                throw new InvalidOperationException("SendPositionUpdate: y is not finite");
+
+            // Use SingleToInt32Bits + explicit byte extraction (same pattern as
+            // TransformPacketBuilder.WriteF32LE) to avoid the two temporary byte[]
+            // allocations that BitConverter.GetBytes(float) causes per call.
+            var payload = new byte[8];
+            int xBits = BitConverter.SingleToInt32Bits(x);
+            int yBits = BitConverter.SingleToInt32Bits(y);
+            payload[0] = (byte) xBits;
+            payload[1] = (byte)(xBits >>  8);
+            payload[2] = (byte)(xBits >> 16);
+            payload[3] = (byte)(xBits >> 24);
+            payload[4] = (byte) yBits;
+            payload[5] = (byte)(yBits >>  8);
+            payload[6] = (byte)(yBits >> 16);
+            payload[7] = (byte)(yBits >> 24);
+
+            var packet = _packetBuilder.Build(PacketType.PositionUpdate, PacketFlags.None, payload);
+            EncryptAndSend(packet);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Build and enqueue an RPC request packet for transmission.
+        /// Convenience wrapper for game code that does not need
+        /// the raw <see cref="BuildPacket"/> / <see cref="Send"/> split.
+        /// The packet is built with <see cref="PacketFlags.Reliable"/> so the
+        /// KCP layer will retransmit on loss.
+        /// </summary>
+        /// <param name="methodId">RPC method ID (see <see cref="RpcMethodId"/>).</param>
+        /// <param name="rpcPayload">
+        /// Method-specific payload bytes, bounded by
+        /// <see cref="RTMPE.Rpc.RpcPacketBuilder.MaxSendablePayloadBytes"/> —
+        /// what is left of one datagram after the packet and RPC headers. A
+        /// larger payload is refused and reported; it is not sent.
+        /// </param>
+        // ⚠️ This parameter's doc said "max 4096 bytes" until 2026-08-23. That
+        // is RpcLimits.MaxPayloadBytes, the bound on what may be RECEIVED;
+        // nearly three quarters of that range could never be sent.  Kept as a
+        // `//` note rather than in the `///` block: an integrator hovering this
+        // parameter wants its contract, not the SDK's changelog about itself.
+        public void SendRpc(uint methodId, byte[] rpcPayload)
+        {
+            if (!IsConnected)
+            {
+                Debug.LogWarning("[RTMPE] NetworkManager.SendRpc: cannot send while not connected.");
+                return;
+            }
+
+            // Source the correlation ID from the CSPRNG-backed allocator so a
+            // network attacker cannot predict or race in-flight request IDs.
+            uint requestId = RequestIdAllocator.Next();
+
+            // Contained, on the same terms as SendEnhancedRpc: this is public
+            // API reached from ordinary game code, so an unguarded throw leaves
+            // the SDK through the caller's own Update.
+            byte[] packet;
+            try
+            {
+#pragma warning disable CS0618  // intentional: built-in method IDs still use the legacy builder
+                byte[] rpcMessage =
+                    RpcPacketBuilder.BuildRequest(methodId, LocalPlayerId, requestId, rpcPayload);
+#pragma warning restore CS0618
+                packet = BuildPacket(PacketType.Rpc, PacketFlags.Reliable, rpcMessage);
+            }
+            catch (ArgumentException ex)
+            {
+                // ⚠️ Debug.LogWarning, not RtmpeLog.Error, and the difference is
+                // the whole point of containing the throw. RtmpeLog.Error is
+                // SUPPRESSED to Debug.Log unless enableDebugLogs is on — which
+                // it is not in a shipped player — so routing a caller's own
+                // mistake through it turns "your RPC threw" into "your RPC
+                // silently never arrives", which is worse than the exception it
+                // replaced. This is a deterministic programmer error, and the
+                // preconditions a few lines up already report at this severity.
+                //
+                // ⛔ ArgumentException only. A blanket catch here would swallow
+                // every future framing fault, including ones that are not the
+                // caller's and must not be hidden.
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkManager.SendRpc: not sent — {ex.Message} " +
+                    $"(method 0x{methodId:X8}). The payload ceiling is " +
+                    $"{RTMPE.Rpc.RpcPacketBuilder.MaxSendablePayloadBytes} bytes.");
+                return;
+            }
+
+            Send(packet, reliable: true);
+        }
+
+        /// <summary>
+        /// Build and enqueue an Enhanced RPC request for a
+        /// <see cref="RtmpeRpcAttribute"/>-decorated method on a
+        /// <see cref="NetworkBehaviour"/> component.
+        ///
+       /// <para>Called internally by <see cref="NetworkBehaviour.RPC"/>. Game code
+        /// should not call this directly — use <c>NetworkBehaviour.RPC()</c> instead.</para>
+        /// </summary>
+        /// <param name="sender">The <c>NetworkBehaviour</c> originating the call.</param>
+        /// <param name="methodName">Name of the <c>[RtmpeRpc]</c>-decorated method.</param>
+        /// <param name="args">Typed arguments (must be serializable by <see cref="RpcSerializer"/>).</param>
+        public void SendEnhancedRpc(NetworkBehaviour sender, string methodName, object[] args)
+        {
+            if (!IsInRoom)
+            {
+                Debug.LogWarning("[RTMPE] NetworkManager.SendEnhancedRpc: must be in a room.");
+                return;
+            }
+
+            if (sender == null)
+            {
+                Debug.LogWarning("[RTMPE] NetworkManager.SendEnhancedRpc: sender is null.");
+                return;
+            }
+
+            if (!RpcRegistry.TryGetMethodId(sender.GetType(), methodName, out uint methodId))
+            {
+                Debug.LogWarning(
+                    $"[RTMPE] NetworkManager.SendEnhancedRpc: no [RtmpeRpc] method named " +
+                    $"'{methodName}' on {sender.GetType().Name}. Ensure the method is public " +
+                    "and decorated with [RtmpeRpc].");
+                return;
+            }
+
+            // Read target from the attribute so callers do not pass it explicitly.
+            RpcRegistry.TryFindMethod(sender.GetType(), methodId, out _, out var attr);
+            var target = attr?.Target ?? RpcTarget.All;
+
+            // CSPRNG-backed correlation ID; see RequestIdAllocator.
+            uint requestId = RequestIdAllocator.Next();
+
+            byte[] rpcPayload;
+            try
+            {
+                rpcPayload = EnhancedRpcPacketBuilder.Build(
+                    methodId, LocalPlayerId, requestId,
+                    sender.NetworkObjectId, target, args);
+            }
+            catch (ArgumentException ex)
+            {
+                // The severity is the whole of it.  RtmpeLog.Error is suppressed
+                // to Debug.Log unless enableDebugLogs is on — which it is not in
+                // a shipped player — so a caller's own mistake reported through
+                // it becomes an RPC that silently never arrives.  SendRpc states
+                // this rule for the identical fault sixty lines above, and both
+                // troubleshooting.md and the 3.0.0 changelog name this severity.
+                //
+                // ⚠️ Rate-gated, because the caller is game code and every fault
+                // this arm reports is deterministic: a wrong argument type, an
+                // over-long string, a payload past the ceiling.  Called from
+                // Update, an ungated line is a console the fault itself has made
+                // unreadable — and the builder's own message already names the
+                // ceiling when the ceiling is what was crossed, so nothing here
+                // states it again for the five other faults that are not.
+                if (WarnGate.ShouldEmit(ref _lastEnhancedRpcRefusalWarnTicks))
+                    Debug.LogWarning(
+                        $"[RTMPE] NetworkManager.SendEnhancedRpc: not sent — {ex.Message} " +
+                        $"(from '{sender.GetType().Name}.{methodName}').");
+                return;
+            }
+            catch (Exception ex)
+            {
+                // Anything that is not an argument fault is not the caller's,
+                // and the containment here exists to keep a framing error out of
+                // the caller's Update rather than to hide it.  Error, because
+                // this is the class a host app's crash reporters exist to
+                // receive — and gated for the same reason, at the same severity
+                // OwnershipManager reports an application callback's throw:
+                // ungated it is 60 stack traces a second into a bounded
+                // diagnostics queue that then holds nothing else.
+                if (WarnGate.ShouldEmit(ref _lastEnhancedRpcFaultWarnTicks))
+                    Debug.LogError(
+                        $"[RTMPE] NetworkManager.SendEnhancedRpc: not sent — unexpected framing " +
+                        $"fault for '{sender.GetType().Name}.{methodName}': " +
+                        $"{ex.GetType().Name}: {ex.Message}");
+                return;
+            }
+
+            // Inside the guard, like the payload build above it.  RPC() is
+            // called from ordinary game code — an Update, a collision callback,
+            // a UI button — and PacketBuilder.Build throws on an oversized
+            // payload, so a bare call here surfaced as an exception out of the
+            // caller's own frame with nothing said about which RPC caused it.
+            // ⛔ The size that reaches this is now bounded by the RPC builder
+            // itself, so this guard should never fire; it stands because the
+            // two limits are derived from different constants and a future
+            // sub-header or header change moves them apart before anyone
+            // notices.
+            byte[] packet;
+            try
+            {
+                packet = BuildPacket(
+                    PacketType.Rpc,
+                    PacketFlags.Reliable | PacketFlags.EnhancedRpc,
+                    rpcPayload);
+            }
+            catch (ArgumentException ex)
+            {
+                // See SendRpc: reported at a severity a shipped player keeps,
+                // and narrowed to the caller's own error.  Gated on the same
+                // reasoning as the payload step above — this method is reached
+                // from Update, so a refusal that repeats is a console the
+                // refusal itself has made unreadable.
+                if (WarnGate.ShouldEmit(ref _lastEnhancedRpcPacketRefusalWarnTicks))
+                    Debug.LogWarning(
+                        $"[RTMPE] NetworkManager.SendEnhancedRpc: not sent — {ex.Message} " +
+                        $"(from '{sender.GetType().Name}.{methodName}'). The parameter ceiling " +
+                        $"is {RTMPE.Rpc.EnhancedRpcPacketBuilder.MaxSendablePayloadBytes} bytes.");
+                return;
+            }
+            catch (Exception ex)
+            {
+                // The same division as the payload builder above: a fault that is
+                // not an argument fault is not the caller's, and containing it
+                // here is what keeps a framing error out of the caller's Update.
+                // Stated in both places or in neither — a method that contains
+                // one of its two framing steps and lets the other through has no
+                // rule, only a habit.
+                if (WarnGate.ShouldEmit(ref _lastEnhancedRpcFaultWarnTicks))
+                    Debug.LogError(
+                        $"[RTMPE] NetworkManager.SendEnhancedRpc: not sent — unexpected framing " +
+                        $"fault for '{sender.GetType().Name}.{methodName}': " +
+                        $"{ex.GetType().Name}: {ex.Message}");
+                return;
+            }
+
+            Send(packet, reliable: true);
+        }
+
+        /// <summary>
+        /// Handle a server-broadcast <c>ApplyDamage</c> (301) RPC.
+        /// Payload: <c>[object_id:8 LE u64][damage:4 LE i32]</c>.
+        /// Looks up the target <see cref="NetworkBehaviour"/> by object ID,
+        /// retrieves its <see cref="IDamageable"/> component (if any), and
+        /// calls <see cref="IDamageable.ReceiveApplyDamage"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para><b>Sample-grade handler retained for backward compatibility.</b>
+        /// This method ships in the SDK runtime because removing it would
+        /// break any game that currently relies on the gateway-emitted 301
+        /// ApplyDamage RPC. It is, however, fundamentally a sample of how
+        /// to bind a server-authoritative damage event to a game's local
+        /// health system — the parsing of <c>(object_id, damage)</c>, the
+        /// <see cref="IDamageable"/> lookup, and the
+        /// <see cref="IDamageable.ReceiveApplyDamage"/> dispatch can all
+        /// live in game code.</para>
+        ///
+        /// <para><b>Recommended pattern for new projects:</b> use a custom
+        /// <c>[RtmpeRpc]</c> method on a <see cref="NetworkBehaviour"/>
+        /// subclass instead. The Enhanced RPC system handles routing /
+        /// authorisation / replay buffering uniformly; reserving the 301
+        /// method-id for SDK use was a pre-Enhanced-RPC ergonomic
+        /// shortcut that the Enhanced framework subsumes.</para>
+        ///
+        /// <para>This handler is kept active rather than wrapped in
+        /// <see cref="ObsoleteAttribute"/> because it is invoked
+        /// reflectively from the RPC dispatch table, not by user code —
+        /// the deprecation warning would never fire at the call site that
+        /// matters. The architectural status is documented here so a
+        /// future cleanup pass can remove it once a sample-project
+        /// replacement ships.</para>
+        /// </remarks>
+        private void HandleApplyDamageRpc(RpcRequest request)
+        {
+            var p = request.Payload;
+            if (p == null || p.Length < 12)
+            {
+                LogDebug("ApplyDamage RPC: payload too short, dropped.");
+                return;
+            }
+
+            ulong objectId = (ulong)p[0]       | ((ulong)p[1] << 8)  | ((ulong)p[2] << 16) |
+                             ((ulong)p[3] << 24)| ((ulong)p[4] << 32) | ((ulong)p[5] << 40) |
+                             ((ulong)p[6] << 48)| ((ulong)p[7] << 56);
+            int damage = p[8] | (p[9] << 8) | (p[10] << 16) | (p[11] << 24);
+
+            if (damage <= 0)
+            {
+                LogDebug("ApplyDamage RPC: non-positive damage, dropped.");
+                return;
+            }
+
+            var nb = Spawner?.Registry?.Get(objectId);
+            if (nb == null)
+            {
+                if (IsDebugLogEnabled)
+                    LogDebug($"ApplyDamage RPC: no object with id {objectId}.");
+                return;
+            }
+
+            // Look up the IDamageable interface on the target object.
+            // IDamageable lives in the SDK Runtime assembly; game code (e.g. HealthController)
+            // implements it. This avoids a compile-time dependency on Samples.
+            var damageable = nb.GetComponentInParent<IDamageable>();
+            if (damageable != null)
+                damageable.ReceiveApplyDamage(damage);
+            else if (IsDebugLogEnabled)
+                LogDebug($"ApplyDamage RPC: object {objectId} has no IDamageable component.");
+        }
+
+        /// <summary>
+        /// Called by RoomManager when JoinRoom/CreateRoom succeeds and the server
+        /// confirms the local player's room UUID. This is the identifier used by
+        /// <see cref="NetworkBehaviour.IsOwner"/> for object ownership comparisons.
+        /// </summary>
+        internal void SetLocalRoomPlayerId(string playerId)
+        {
+            _localPlayerStringId = playerId;
+            LogDebug($"LocalRoomPlayerId set to: {playerId}");
+        }
+
+        /// <summary>
+        /// Test-only helper to directly set <see cref="LocalPlayerStringId"/>.
+        /// Accessible from <c>RTMPE.SDK.Tests</c> via <c>InternalsVisibleTo</c>.
+        /// Do NOT call from production code.
+        /// </summary>
+        internal void SetLocalPlayerStringId(string id) => _localPlayerStringId = id;
+
+        /// <summary>
+        /// Wrap <paramref name="payload"/> in a <see cref="PacketType.Data"/> header
+        /// and enqueue it on the network thread for transmission.
+        ///
+       /// Called by <c>NetworkTransform</c> and any other SDK component
+        /// that needs to send a raw data payload without managing the PacketBuilder
+        /// directly.  Must be called from the Unity main thread.
+        /// </summary>
+        /// <param name="payload">
+        /// The serialised payload bytes.  A <see langword="null"/> or empty array
+        /// is silently ignored.
+        /// </param>
+        internal void SendData(byte[] payload)
+            => SendData(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendData(byte[])"/>.
+        /// </summary>
+        internal void SendData(byte[] payload, int payloadLength)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payloadLength <= 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.Data,
+                PacketFlags.None,
+                payload, payloadLength);
+
+            EncryptAndSend(packet);
+        }
+
+        /// <summary>
+        /// Wrap <paramref name="payload"/> in a <see cref="PacketType.InputPayload"/>
+        /// header (0x43) and transmit it as an unreliable UDP packet.
+        ///
+       /// <para>Called by <see cref="RTMPE.Sync.NetworkTransform"/> once per
+        /// 30 Hz tick to ship the unacknowledged-input ring buffer to the Sync
+        /// Service for server-authoritative simulation.  Built by
+        /// <see cref="RTMPE.Sync.InputPacketBuilder.BuildBatchPayload"/>.</para>
+        ///
+       /// <para>Player identity is intentionally NOT in the payload — the
+        /// gateway resolves session_id → authoritative player_id and embeds
+        /// both in the NATS envelope before the Sync Service ever sees the
+        /// bytes.  This eliminates the client-spoofing surface that would
+        /// exist if a client could stamp any player_id on its inputs.</para>
+        ///
+       /// <para>Unreliable on purpose: the next batch supersedes the prior
+        /// (the buffer holds every unacknowledged frame), so a dropped
+        /// packet costs at most one tick of latency until the next send.</para>
+        /// </summary>
+        /// <param name="payload">
+        /// Wire payload built by <c>InputPacketBuilder.BuildBatchPayload</c>.
+        /// A <see langword="null"/> or empty array is silently ignored.
+        /// </param>
+        internal void SendInput(byte[] payload)
+            => SendInput(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendInput(byte[])"/>.
+        /// </summary>
+        internal void SendInput(byte[] payload, int payloadLength)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payloadLength <= 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.InputPayload,
+                PacketFlags.None,
+                payload, payloadLength);
+
+            EncryptAndSend(packet);
+        }
+
+        /// <summary>
+        /// Wrap <paramref name="payload"/> in a <see cref="PacketType.StateSync"/> header
+        /// and transmit it as an unreliable UDP packet.
+        ///
+       /// <para>Called by <see cref="RTMPE.Sync.NetworkTransform"/> to send
+        /// transform updates in either the full-precision or the quantized
+        /// layout.  StateSync packets flow through the Sync Engine which
+        /// aggregates and rebroadcasts them to all room members at the 30 Hz
+        /// tick rate.</para>
+        ///
+       /// <para>Sending as StateSync rather than Data means the Sync Engine
+        /// processes the payload as object state, applying interest-zone filtering
+        /// and dead-client pruning before the broadcast.</para>
+        ///
+       /// <para>Rigidbody state does not travel here — see
+        /// <see cref="SendPhysicsSync(byte[], int)"/>.</para>
+        /// </summary>
+        /// <param name="payload">
+        /// Transform payload built by <see cref="RTMPE.Sync.TransformPacketBuilder"/>.
+        /// A <see langword="null"/> or empty array is silently ignored.
+        /// </param>
+        internal void SendStateSync(byte[] payload)
+            => SendStateSync(payload, payload?.Length ?? 0);
+
+        /// <summary>
+        /// Pooled-buffer overload of <see cref="SendStateSync(byte[])"/>.
+        /// </summary>
+        internal void SendStateSync(byte[] payload, int payloadLength)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payloadLength <= 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.StateSync,
+                PacketFlags.None,
+                payload, payloadLength);
+
+            EncryptAndSend(packet);
+        }
+
+        /// <summary>
+        /// Wrap a rigidbody payload in a <see cref="PacketType.PhysicsSync"/>
+        /// header and transmit it as an unreliable UDP packet.
+        ///
+       /// <para>Called by <see cref="RTMPE.Sync.NetworkRigidbody"/> and
+        /// <see cref="RTMPE.Sync.NetworkRigidbody2D"/>.  A separate send method
+        /// rather than a flag on <see cref="SendStateSync(byte[], int)"/>: the
+        /// two layouts share lengths, so a caller that reached for the wrong one
+        /// would produce a frame the receiver reads under the wrong grammar
+        /// without either side detecting it.  Two methods make that choice
+        /// explicit at the call site.</para>
+        ///
+       /// <para>No Sync Service consumer ingests rigidbody state yet; the
+        /// gateway validates the frame and drops it, raising
+        /// <c>rtmpe_gateway_packets_unimplemented_total{packet_type="physics_sync"}</c>.</para>
+        /// </summary>
+        /// <param name="payload">
+        /// Rigidbody payload built by <see cref="RTMPE.Sync.PhysicsPacketBuilder"/>.
+        /// A <see langword="null"/> or empty array is silently ignored.
+        /// </param>
+        /// <param name="payloadLength">
+        /// Bytes to send from <paramref name="payload"/> — the return value of
+        /// the builder's <c>*Into</c> method, which may be shorter than a
+        /// pooled buffer's length.
+        /// </param>
+        internal void SendPhysicsSync(byte[] payload, int payloadLength)
+        {
+            if (_networkThread == null || _packetBuilder == null) return;
+            if (payload == null || payloadLength <= 0) return;
+
+            var packet = _packetBuilder.Build(
+                PacketType.PhysicsSync,
+                PacketFlags.None,
+                payload, payloadLength);
+
+            EncryptAndSend(packet);
+        }
+
+        /// <summary>
+        /// Build a complete wire packet (13-byte header + payload) using the
+        /// connection's shared <see cref="PacketBuilder"/>. Sequence numbers are
+        /// atomically assigned so the gateway sees a monotonic counter regardless
+        /// of which SDK component originates the packet.
+        ///
+       /// Called by SpawnManager, OwnershipManager, and any other SDK component
+        /// that needs to build a typed packet for transmission via <see cref="Send"/>.
+        /// </summary>
+        internal byte[] BuildPacket(PacketType type, PacketFlags flags, byte[] payload)
+        {
+            if (_packetBuilder == null)
+                throw new InvalidOperationException(
+                    "NetworkManager.BuildPacket: no active PacketBuilder (not connected).");
+            return _packetBuilder.Build(type, flags, payload);
+        }
+
+    }
+}
