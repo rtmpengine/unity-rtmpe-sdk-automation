@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RTMPE.SDK.Analyzers</AssemblyName>
+    <RootNamespace>RTMPE.SDK.Analyzers</RootNamespace>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <!-- The analyzer must build warning-clean (including RS-prefixed authoring
+         rules); enforce it here so every build path — make, CI's transitive
+         shard compile, and a local build — holds the bar, not just a manual flag. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- Pinned to a conservative point on Unity 6000.3.13f1's Roslyn 4.x line; the
+       value and its still-pending on-disk-editor confirmation are tracked in
+       Tooling/COMPILER_COMPATIBILITY.md. The compiler is a build-time dependency
+       only and is never shipped to the player (PrivateAssets="all"). -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Release tracking (RS2008) is required once the extended analyzer rules are
+       enforced; every rule is listed under "New Rules" in the unshipped file. -->
+  <ItemGroup>
+    <AdditionalFiles Include="AnalyzerReleases.Shipped.md" />
+    <AdditionalFiles Include="AnalyzerReleases.Unshipped.md" />
+  </ItemGroup>
+
+  <!-- The deterministic engine supplies the FNV-1a method-id hash and the
+       reserved-id set the RPC collision rules (RTMPE1003/1004) mirror, so the
+       hash has a single source of truth shared with the runtime guard. -->
+  <ItemGroup>
+    <ProjectReference Include="..\RTMPE.SDK.Conversion.Core\RTMPE.SDK.Conversion.Core.csproj" />
+  </ItemGroup>
+
+  <!-- This DLL ships inside the Unity package and is byte-compared against a
+       fresh build by check-analyzers-fresh, so its Release bytes must be a
+       pure function of source + compiler (the SDK is pinned by the
+       Tooling-scoped global.json — scoped there, not repo-root, so the pin
+       governs exactly the byte-compared builds and nothing else). Two SDK
+       defaults break that and are disabled here:
+       • a Release PDB embeds the build machine's absolute obj/ path in the
+         PE debug directory — a CI checkout can never reproduce a dev-box
+         path, so no PDB is emitted (Debug builds keep full symbols);
+       • the git integration stamps HEAD's commit SHA into
+         AssemblyInformationalVersion — the committed DLL would always carry
+         the previous commit's SHA while a CI rebuild stamps the new one,
+         making the freshness gate unpassable by construction. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+  <PropertyGroup>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+</Project>

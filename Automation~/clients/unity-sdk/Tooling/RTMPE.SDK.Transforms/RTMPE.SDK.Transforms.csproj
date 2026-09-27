@@ -1,0 +1,51 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RTMPE.SDK.Transforms</AssemblyName>
+    <RootNamespace>RTMPE.SDK.Transforms</RootNamespace>
+    <!-- Build warning-clean on every path, including CI's transitive shard compile. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pure syntax rewriters: the C# compiler API is the only dependency. No
+         Workspaces, so the same engine the IDE code-fix uses also runs in the
+         Unity-side wizard, with byte-identical output. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The closed type map lives with the identity engine so the CLI can plan
+         without Roslyn; the generation transform re-verifies against it. -->
+    <ProjectReference Include="..\RTMPE.SDK.Conversion.Core\RTMPE.SDK.Conversion.Core.csproj" />
+    <!-- The receiver rule (ThisInstance) and the pre-spawn set (PreSpawnHooks) are
+         declared once, in the analyzer project, and read from here: three copies of
+         one list disagreed about `(this as IBoot)`. Analyzers never references
+         Transforms, so the layering rule the golden suite pins is unchanged. -->
+    <ProjectReference Include="..\RTMPE.SDK.Analyzers\RTMPE.SDK.Analyzers.csproj" />
+  </ItemGroup>
+
+  <!-- This DLL ships inside the Unity package and is byte-compared against a
+       fresh build by check-analyzers-fresh, so its Release bytes must be a
+       pure function of source + compiler (the SDK is pinned by the
+       Tooling-scoped global.json — scoped there, not repo-root, so the pin
+       governs exactly the byte-compared builds and nothing else). Two SDK
+       defaults break that and are disabled here:
+       • a Release PDB embeds the build machine's absolute obj/ path in the
+         PE debug directory — a CI checkout can never reproduce a dev-box
+         path, so no PDB is emitted (Debug builds keep full symbols);
+       • the git integration stamps HEAD's commit SHA into
+         AssemblyInformationalVersion — the committed DLL would always carry
+         the previous commit's SHA while a CI rebuild stamps the new one,
+         making the freshness gate unpassable by construction. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+  <PropertyGroup>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+</Project>
