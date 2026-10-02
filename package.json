@@ -1,0 +1,49 @@
+{
+  "name": "com.rtmpe.sdk",
+  "version": "1.0.8",
+  "displayName": "RTMPE SDK",
+  "description": "Real-time multiplayer for Unity: rooms, networked objects, synchronised state and RPCs over an encrypted connection to the RTMPE service, with editor tooling that helps convert single-player projects.",
+  "license": "SEE LICENSE IN LICENSE.md",
+  "unity": "2022.3",
+  "documentationUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk-automation/blob/main/Documentation~/index.md",
+  "changelogUrl": "https://github.com/rtmpengine/unity-rtmpe-sdk-automation/blob/main/CHANGELOG.md",
+  "keywords": [
+    "multiplayer",
+    "networking",
+    "realtime",
+    "udp",
+    "flatbuffers"
+  ],
+  "author": {
+    "name": "RTMPE",
+    "url": "https://github.com/rtmpengine"
+  },
+  "dependencies": {},
+  "samples": [
+    {
+      "displayName": "Basic Connection",
+      "description": "Connecting to the RTMPE service, handling connection events and disconnecting cleanly.",
+      "path": "Samples~/BasicConnection"
+    },
+    {
+      "displayName": "Player Spawn Flow",
+      "description": "Connect, open a room and spawn the local player, using the prefab id from the generated prefab registry.",
+      "path": "Samples~/PlayerSpawnFlow"
+    },
+    {
+      "displayName": "Scene Transitions",
+      "description": "A room moving between two scenes, with RtmpeSceneLoader loading each scene and reporting readiness.",
+      "path": "Samples~/SceneTransitions"
+    },
+    {
+      "displayName": "Two Player Room",
+      "description": "Two clients in one room through matchmaking, each moving its own avatar, with a credential component for player builds.",
+      "path": "Samples~/TwoPlayerRoom"
+    },
+    {
+      "displayName": "Shared World",
+      "description": "Room state that belongs to no player, kept on the world object: a shared board that late joiners receive and the next host keeps.",
+      "path": "Samples~/SharedWorld"
+    }
+  ]
+}
