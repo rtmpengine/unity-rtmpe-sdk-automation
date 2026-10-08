@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RTMPE.SDK.Conversion.Core</AssemblyName>
+    <RootNamespace>RTMPE.SDK.Conversion.Core</RootNamespace>
+    <!-- Build warning-clean on every path, including CI's transitive shard compile. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- This DLL ships inside the Unity package and is byte-compared against a
+       fresh build by check-analyzers-fresh, so its Release bytes must be a
+       pure function of source + compiler (the SDK is pinned by the
+       Tooling-scoped global.json — scoped there, not repo-root, so the pin
+       governs exactly the byte-compared builds and nothing else). Two SDK
+       defaults break that and are disabled here:
+       • a Release PDB embeds the build machine's absolute obj/ path in the
+         PE debug directory — a CI checkout can never reproduce a dev-box
+         path, so no PDB is emitted (Debug builds keep full symbols);
+       • the git integration stamps HEAD's commit SHA into
+         AssemblyInformationalVersion — the committed DLL would always carry
+         the previous commit's SHA while a CI rebuild stamps the new one,
+         making the freshness gate unpassable by construction. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+  <PropertyGroup>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,52 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTMPE.SDK.Conversion.Core", "RTMPE.SDK.Conversion.Core\RTMPE.SDK.Conversion.Core.csproj", "{2B7BC7A4-CEDC-44CB-B291-104EAC23A0EC}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTMPE.SDK.Analyzers", "RTMPE.SDK.Analyzers\RTMPE.SDK.Analyzers.csproj", "{C52C86D9-6E49-4B38-BDF5-EC455F67ADB4}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTMPE.SDK.Analysis", "RTMPE.SDK.Analysis\RTMPE.SDK.Analysis.csproj", "{7F3E9C21-4B6A-4D8E-9F12-3C5A7E8B1D04}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTMPE.SDK.Transforms", "RTMPE.SDK.Transforms\RTMPE.SDK.Transforms.csproj", "{AB3485D2-295F-4ADE-8320-17BBAE1502B0}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTMPE.SDK.CodeFixes", "RTMPE.SDK.CodeFixes\RTMPE.SDK.CodeFixes.csproj", "{E1D29E93-67DC-4316-9BFA-DF06C7F7900C}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RTMPE.SDK.ConversionCli", "RTMPE.SDK.ConversionCli\RTMPE.SDK.ConversionCli.csproj", "{66B02ADE-039C-4C18-BAC8-7607B4400B1F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2B7BC7A4-CEDC-44CB-B291-104EAC23A0EC}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2B7BC7A4-CEDC-44CB-B291-104EAC23A0EC}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2B7BC7A4-CEDC-44CB-B291-104EAC23A0EC}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2B7BC7A4-CEDC-44CB-B291-104EAC23A0EC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C52C86D9-6E49-4B38-BDF5-EC455F67ADB4}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C52C86D9-6E49-4B38-BDF5-EC455F67ADB4}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C52C86D9-6E49-4B38-BDF5-EC455F67ADB4}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C52C86D9-6E49-4B38-BDF5-EC455F67ADB4}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7F3E9C21-4B6A-4D8E-9F12-3C5A7E8B1D04}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7F3E9C21-4B6A-4D8E-9F12-3C5A7E8B1D04}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7F3E9C21-4B6A-4D8E-9F12-3C5A7E8B1D04}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7F3E9C21-4B6A-4D8E-9F12-3C5A7E8B1D04}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AB3485D2-295F-4ADE-8320-17BBAE1502B0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AB3485D2-295F-4ADE-8320-17BBAE1502B0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AB3485D2-295F-4ADE-8320-17BBAE1502B0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AB3485D2-295F-4ADE-8320-17BBAE1502B0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E1D29E93-67DC-4316-9BFA-DF06C7F7900C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E1D29E93-67DC-4316-9BFA-DF06C7F7900C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E1D29E93-67DC-4316-9BFA-DF06C7F7900C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E1D29E93-67DC-4316-9BFA-DF06C7F7900C}.Release|Any CPU.Build.0 = Release|Any CPU
+		{66B02ADE-039C-4C18-BAC8-7607B4400B1F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{66B02ADE-039C-4C18-BAC8-7607B4400B1F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{66B02ADE-039C-4C18-BAC8-7607B4400B1F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{66B02ADE-039C-4C18-BAC8-7607B4400B1F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
