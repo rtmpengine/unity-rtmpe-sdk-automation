@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RTMPE.SDK.Analysis</AssemblyName>
+    <RootNamespace>RTMPE.SDK.Analysis</RootNamespace>
+    <!-- Build warning-clean on every path, including CI's transitive shard compile. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!-- Same Roslyn line the analyzer pins; the engine consumes Compilation and
+       runs the shipped analyzers, so it must bind the same compiler surface. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.0" />
+  </ItemGroup>
+
+  <!-- The readiness score is the analyzers' own verdicts, weighted: the engine
+       runs the shipped diagnostic analyzers and the reserved-id guard rather
+       than restating their rules, so the score cannot drift from the IDE. -->
+  <ItemGroup>
+    <ProjectReference Include="..\RTMPE.SDK.Analyzers\RTMPE.SDK.Analyzers.csproj" />
+    <ProjectReference Include="..\RTMPE.SDK.Conversion.Core\RTMPE.SDK.Conversion.Core.csproj" />
+  </ItemGroup>
+
+</Project>

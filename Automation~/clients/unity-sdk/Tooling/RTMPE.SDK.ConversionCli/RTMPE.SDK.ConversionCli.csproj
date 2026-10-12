@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>RTMPE.SDK.ConversionCli</AssemblyName>
+    <RootNamespace>RTMPE.SDK.ConversionCli</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.3.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\RTMPE.SDK.Conversion.Core\RTMPE.SDK.Conversion.Core.csproj" />
+    <ProjectReference Include="..\RTMPE.SDK.Transforms\RTMPE.SDK.Transforms.csproj" />
+    <!-- The readiness verb drives the Phase-5 scorer; the engine stays in
+         RTMPE.SDK.Analysis — this host only assembles the compilation and
+         writes the artifact. -->
+    <ProjectReference Include="..\RTMPE.SDK.Analysis\RTMPE.SDK.Analysis.csproj" />
+    <!-- Declared because FixCli reads UnityFrameLoops directly. It arrives
+         transitively through Analysis today, so nothing fails without this line
+         until somebody makes that reference private or drops it — at which point
+         the break is in a file that never named the dependency it was using. -->
+    <ProjectReference Include="..\RTMPE.SDK.Analyzers\RTMPE.SDK.Analyzers.csproj" />
+  </ItemGroup>
+
+</Project>
