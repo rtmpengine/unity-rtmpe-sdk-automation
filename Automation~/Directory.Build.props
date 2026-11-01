@@ -1,0 +1,98 @@
+<Project>
+
+  <!--
+    Repository-wide NuGet policy.
+
+    Every other toolchain here states what it depends on and refuses to build
+    on an advisory: Cargo has Cargo.lock plus `cargo audit`, Go has go.sum plus
+    `govulncheck`, npm has package-lock.json plus `npm audit` and an allow-list.
+    NuGet had none of the three, while `restore` and `build` execute MSBuild
+    targets supplied by the packages themselves — so the one toolchain that
+    runs third-party code at build time was also the one nothing in the
+    pipeline could object to.
+
+    MSBuild stops at the FIRST Directory.Build.props it finds walking up from a
+    project, so this file governs a project only when no nearer one shadows it.
+    `tests/unit/Directory.Build.props` therefore imports this file explicitly;
+    without that import every test shard silently falls outside every rule
+    below, which — together with a project weakening a property locally, or
+    naming an NU19xx code in its own NoWarn — is the failure mode
+    scripts/check-nuget-supply-chain.sh exists to refuse.
+
+    ── The pinned graph ─────────────────────────────────────────────────────
+    Direct references are exact in the project files; transitives were not
+    recorded anywhere, so two restores months apart could compile different
+    code from the same commit. A lock file per project records the whole
+    resolved graph with content hashes, and locked mode makes the graph a
+    contract rather than a snapshot: restore fails instead of quietly
+    resolving something else.
+
+    ⚠️ Locked mode does NOT refuse a project that has no lock file — it writes
+    one and exits 0. An absent lock file is therefore invisible here and is
+    held by the guard instead, which reads the set of project files rather
+    than the set of lock files.
+
+    Adding or upgrading a package is expected to fail restore with NU1004,
+    naming the reference that changed. `make nuget-relock` is the deliberate
+    path through it.
+
+    ── The advisory gate ────────────────────────────────────────────────────
+    NuGetAudit is on by default for direct references on this SDK and reports
+    warnings. Both halves of that default are too weak to be a gate:
+
+      * Transitive packages are where the graph actually is. Measured on this
+        repository's own SDK: a reference whose own dependency carries three
+        advisories reports 0 findings under `direct` and 3 under `all`.
+      * A warning is not a refusal. NU1901-NU1904 (low → critical) are
+        promoted to errors, matching the deny-warnings cargo-audit policy CI
+        already runs for Rust.
+
+    An advisory that must be carried is suppressed with a NuGetAuditSuppress
+    item naming the advisory URL and the reason, next to the reference that
+    pulls it — the same shape as .cargo/audit.toml, and for the same reason:
+    a suppression nobody has to restate stops being a decision.
+
+    NU1900 — the audit source did not answer — stays a warning on a developer
+    machine, which may legitimately be offline, and becomes an error under CI,
+    which may not. A scan that could not fetch advisory data reports zero
+    findings and is indistinguishable from a clean one; that is the same trap
+    an offline `npm audit` sets, and the only place it can be closed is where
+    the network is guaranteed.
+  -->
+
+  <!--
+    ── The pinned language ──────────────────────────────────────────────────
+    CI asks setup-dotnet for `8.0.x`, which resolves to whatever patch is
+    newest on the day, and the compiler that ships inside a patch decides the
+    default language version. That is a floating input: the same commit
+    compiled on 8.0.420 and on 8.0.424 is compiled under two different
+    languages, and only the second one is checked by anything.
+
+    It is not hypothetical. A test declared `for (int field = 0; ...)` inside a
+    property accessor, which is ordinary C# 12 and, from C# 14, a reference to
+    the property's synthesized backing field — so the shard built clean on
+    every developer machine and failed to compile in CI, on a patch bump
+    nobody made. Pinning the version states which language this repository is
+    written in, and moves the day that changes to a deliberate edit here.
+  -->
+  <PropertyGroup>
+    <LangVersion>12.0</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RestoreLockedMode>true</RestoreLockedMode>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NuGetAudit>true</NuGetAudit>
+    <NuGetAuditMode>all</NuGetAuditMode>
+    <NuGetAuditLevel>low</NuGetAuditLevel>
+    <WarningsAsErrors>$(WarningsAsErrors);NU1901;NU1902;NU1903;NU1904</WarningsAsErrors>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(CI)' == 'true'">
+    <WarningsAsErrors>$(WarningsAsErrors);NU1900</WarningsAsErrors>
+  </PropertyGroup>
+
+</Project>
